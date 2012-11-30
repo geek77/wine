@@ -2,7 +2,6 @@
  * Wine X11drv Xrandr interface
  *
  * Copyright 2003 Alexander James Pasadyn
- * Copyright 2012 Henri Verbeet for CodeWeavers
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -48,23 +47,10 @@ MAKE_FUNCPTR(XRRSetScreenConfig)
 MAKE_FUNCPTR(XRRSetScreenConfigAndRate)
 MAKE_FUNCPTR(XRRSizes)
 
-#ifdef HAVE_XRRGETSCREENRESOURCES
-MAKE_FUNCPTR(XRRFreeCrtcInfo)
-MAKE_FUNCPTR(XRRFreeOutputInfo)
-MAKE_FUNCPTR(XRRFreeScreenResources)
-MAKE_FUNCPTR(XRRGetCrtcInfo)
-MAKE_FUNCPTR(XRRGetOutputInfo)
-MAKE_FUNCPTR(XRRGetScreenResources)
-MAKE_FUNCPTR(XRRSetCrtcConfig)
-static typeof(XRRGetScreenResources) *pXRRGetScreenResourcesCurrent;
-static RRMode *xrandr12_modes;
-static int primary_crtc;
-#endif
-
 #undef MAKE_FUNCPTR
 
 static struct x11drv_mode_info *dd_modes;
-static SizeID *xrandr10_modes;
+static SizeID *xrandr_modes;
 static unsigned int xrandr_mode_count;
 
 static int load_xrandr(void)
@@ -89,19 +75,10 @@ static int load_xrandr(void)
         LOAD_FUNCPTR(XRRSetScreenConfig)
         LOAD_FUNCPTR(XRRSetScreenConfigAndRate)
         LOAD_FUNCPTR(XRRSizes)
-        r = 1;
 
-#ifdef HAVE_XRRGETSCREENRESOURCES
-        LOAD_FUNCPTR(XRRFreeCrtcInfo)
-        LOAD_FUNCPTR(XRRFreeOutputInfo)
-        LOAD_FUNCPTR(XRRFreeScreenResources)
-        LOAD_FUNCPTR(XRRGetCrtcInfo)
-        LOAD_FUNCPTR(XRRGetOutputInfo)
-        LOAD_FUNCPTR(XRRGetScreenResources)
-        LOAD_FUNCPTR(XRRSetCrtcConfig)
-        r = 2;
-#endif
 #undef LOAD_FUNCPTR
+
+        r = 1;   /* success */
 
 sym_not_found:
         if (!r)  TRACE("Unable to load function ptrs from XRandR library\n");
@@ -114,7 +91,7 @@ static int XRandRErrorHandler(Display *dpy, XErrorEvent *event, void *arg)
     return 1;
 }
 
-static int xrandr10_get_current_mode(void)
+static int X11DRV_XRandR_GetCurrentMode(void)
 {
     SizeID size;
     Rotation rot;
@@ -130,7 +107,7 @@ static int xrandr10_get_current_mode(void)
 
     for (i = 0; i < xrandr_mode_count; ++i)
     {
-        if (xrandr10_modes[i] == size && dd_modes[i].refresh_rate == rate)
+        if (xrandr_modes[i] == size && dd_modes[i].refresh_rate == rate)
         {
             res = i;
             break;
@@ -144,7 +121,7 @@ static int xrandr10_get_current_mode(void)
     return res;
 }
 
-static LONG xrandr10_set_current_mode( int mode )
+static LONG X11DRV_XRandR_SetCurrentMode(int mode)
 {
     SizeID size;
     Rotation rot;
@@ -163,7 +140,7 @@ static LONG xrandr10_set_current_mode( int mode )
           dd_modes[mode].height,
           dd_modes[mode].refresh_rate);
 
-    size = xrandr10_modes[mode];
+    size = xrandr_modes[mode];
     rate = dd_modes[mode].refresh_rate;
 
     if (rate)
@@ -183,7 +160,7 @@ static LONG xrandr10_set_current_mode( int mode )
     return DISP_CHANGE_FAILED;
 }
 
-static void xrandr10_init_modes(void)
+static void xrandr_init_modes(void)
 {
     XRRScreenSize *sizes;
     int sizes_count;
@@ -220,15 +197,15 @@ static void xrandr10_init_modes(void)
 
     TRACE("XRandR modes: count=%d\n", nmodes);
 
-    if (!(xrandr10_modes = HeapAlloc( GetProcessHeap(), 0, sizeof(*xrandr10_modes) * nmodes )))
+    if (!(xrandr_modes = HeapAlloc( GetProcessHeap(), 0, sizeof(*xrandr_modes) * nmodes )))
     {
         ERR("Failed to allocate xrandr mode info array.\n");
         return;
     }
 
-    dd_modes = X11DRV_Settings_SetHandlers( "XRandR 1.0",
-                                            xrandr10_get_current_mode,
-                                            xrandr10_set_current_mode,
+    dd_modes = X11DRV_Settings_SetHandlers( "XRandR",
+                                            X11DRV_XRandR_GetCurrentMode,
+                                            X11DRV_XRandR_SetCurrentMode,
                                             nmodes, 1 );
 
     xrandr_mode_count = 0;
@@ -244,13 +221,13 @@ static void xrandr10_init_modes(void)
             for (j = 0; j < rates_count; ++j)
             {
                 X11DRV_Settings_AddOneMode( sizes[i].width, sizes[i].height, 0, rates[j] );
-                xrandr10_modes[xrandr_mode_count++] = i;
+                xrandr_modes[xrandr_mode_count++] = i;
             }
         }
         else
         {
             X11DRV_Settings_AddOneMode( sizes[i].width, sizes[i].height, 0, 0 );
-            xrandr10_modes[xrandr_mode_count++] = i;
+            xrandr_modes[xrandr_mode_count++] = i;
         }
     }
 
@@ -260,223 +237,6 @@ static void xrandr10_init_modes(void)
     TRACE("Available DD modes: count=%d\n", nmodes);
     TRACE("Enabling XRandR\n");
 }
-
-#ifdef HAVE_XRRGETSCREENRESOURCES
-
-static int xrandr12_get_current_mode(void)
-{
-    XRRScreenResources *resources;
-    XRRCrtcInfo *crtc_info;
-    int i, ret = -1;
-
-    if (!(resources = pXRRGetScreenResourcesCurrent( gdi_display, root_window )))
-    {
-        ERR("Failed to get screen resources.\n");
-        return 0;
-    }
-
-    if (resources->ncrtc <= primary_crtc ||
-        !(crtc_info = pXRRGetCrtcInfo( gdi_display, resources, resources->crtcs[primary_crtc] )))
-    {
-        pXRRFreeScreenResources( resources );
-        ERR("Failed to get CRTC info.\n");
-        return 0;
-    }
-
-    TRACE("CRTC %d: mode %#lx, %ux%u+%d+%d.\n", primary_crtc, crtc_info->mode,
-          crtc_info->width, crtc_info->height, crtc_info->x, crtc_info->y);
-
-    for (i = 0; i < xrandr_mode_count; ++i)
-    {
-        if (xrandr12_modes[i] == crtc_info->mode)
-        {
-            ret = i;
-            break;
-        }
-    }
-
-    pXRRFreeCrtcInfo( crtc_info );
-    pXRRFreeScreenResources( resources );
-
-    if (ret == -1)
-    {
-        ERR("Unknown mode, returning default.\n");
-        ret = 0;
-    }
-
-    return ret;
-}
-
-static LONG xrandr12_set_current_mode( int mode )
-{
-    Status status = RRSetConfigFailed;
-    XRRScreenResources *resources;
-    XRRCrtcInfo *crtc_info;
-
-    mode = mode % xrandr_mode_count;
-
-    if (!(resources = pXRRGetScreenResourcesCurrent( gdi_display, root_window )))
-    {
-        ERR("Failed to get screen resources.\n");
-        return DISP_CHANGE_FAILED;
-    }
-
-    if (resources->ncrtc <= primary_crtc ||
-        !(crtc_info = pXRRGetCrtcInfo( gdi_display, resources, resources->crtcs[primary_crtc] )))
-    {
-        pXRRFreeScreenResources( resources );
-        ERR("Failed to get CRTC info.\n");
-        return DISP_CHANGE_FAILED;
-    }
-
-    TRACE("CRTC %d: mode %#lx, %ux%u+%d+%d.\n", primary_crtc, crtc_info->mode,
-          crtc_info->width, crtc_info->height, crtc_info->x, crtc_info->y);
-
-    status = pXRRSetCrtcConfig( gdi_display, resources, resources->crtcs[primary_crtc],
-                                CurrentTime, crtc_info->x, crtc_info->y, xrandr12_modes[mode],
-                                crtc_info->rotation, crtc_info->outputs, crtc_info->noutput );
-
-    pXRRFreeCrtcInfo( crtc_info );
-    pXRRFreeScreenResources( resources );
-
-    if (status != RRSetConfigSuccess)
-    {
-        ERR("Resolution change not successful -- perhaps display has changed?\n");
-        return DISP_CHANGE_FAILED;
-    }
-
-    X11DRV_resize_desktop( dd_modes[mode].width, dd_modes[mode].height );
-    return DISP_CHANGE_SUCCESSFUL;
-}
-
-static XRRCrtcInfo *xrandr12_get_primary_crtc_info( XRRScreenResources *resources, int *crtc_idx )
-{
-    XRRCrtcInfo *crtc_info;
-    int i;
-
-    for (i = 0; i < resources->ncrtc; ++i)
-    {
-        crtc_info = pXRRGetCrtcInfo( gdi_display, resources, resources->crtcs[i] );
-        if (!crtc_info || crtc_info->mode == None)
-        {
-            pXRRFreeCrtcInfo( crtc_info );
-            continue;
-        }
-
-        *crtc_idx = i;
-        return crtc_info;
-    }
-
-    return NULL;
-}
-
-static int xrandr12_init_modes(void)
-{
-    XRRScreenResources *resources;
-    XRROutputInfo *output_info;
-    XRRCrtcInfo *crtc_info;
-    int ret = -1;
-    int i, j;
-
-    if (!(resources = pXRRGetScreenResourcesCurrent( gdi_display, root_window )))
-    {
-        ERR("Failed to get screen resources.\n");
-        return ret;
-    }
-
-    if (!resources->ncrtc)
-    {
-        pXRRFreeScreenResources( resources );
-        if (!(resources = pXRRGetScreenResources( gdi_display, root_window )))
-        {
-            ERR("Failed to get screen resources.\n");
-            return ret;
-        }
-    }
-
-    if (!(crtc_info = xrandr12_get_primary_crtc_info( resources, &primary_crtc )))
-    {
-        pXRRFreeScreenResources( resources );
-        ERR("Failed to get primary CRTC info.\n");
-        return ret;
-    }
-
-    TRACE("CRTC %d: mode %#lx, %ux%u+%d+%d.\n", primary_crtc, crtc_info->mode,
-          crtc_info->width, crtc_info->height, crtc_info->x, crtc_info->y);
-
-    if (!crtc_info->noutput || !(output_info = pXRRGetOutputInfo( gdi_display, resources, crtc_info->outputs[0] )))
-    {
-        pXRRFreeCrtcInfo( crtc_info );
-        pXRRFreeScreenResources( resources );
-        ERR("Failed to get output info.\n");
-        return ret;
-    }
-
-    TRACE("OUTPUT 0: name %s.\n", debugstr_a(output_info->name));
-
-    if (!output_info->nmode)
-    {
-        ERR("Output has no modes.\n");
-        goto done;
-    }
-
-    /* Recent (304.64, possibly earlier) versions of the nvidia driver only
-     * report a DFP's native mode through RandR 1.2 / 1.3. Standard DMT modes
-     * are only listed through RandR 1.0 / 1.1. This is completely useless,
-     * but NVIDIA considers this a feature, so it's unlikely to change. The
-     * best we can do is to fall back to RandR 1.0 and encourage users to
-     * consider more cooperative driver vendors when we detect such a
-     * configuration. */
-    if (output_info->nmode == 1 && XQueryExtension( gdi_display, "NV-CONTROL", &i, &j, &ret ))
-    {
-        ERR_(winediag)("Broken NVIDIA RandR detected, falling back to RandR 1.0. "
-                       "Please consider using the Nouveau driver instead.\n");
-        ret = -1;
-        goto done;
-    }
-
-    if (!(xrandr12_modes = HeapAlloc( GetProcessHeap(), 0, sizeof(*xrandr12_modes) * output_info->nmode )))
-    {
-        ERR("Failed to allocate xrandr mode info array.\n");
-        goto done;
-    }
-
-    dd_modes = X11DRV_Settings_SetHandlers( "XRandR 1.2",
-                                            xrandr12_get_current_mode,
-                                            xrandr12_set_current_mode,
-                                            output_info->nmode, 1 );
-
-    xrandr_mode_count = 0;
-    for (i = 0; i < output_info->nmode; ++i)
-    {
-        for (j = 0; j < resources->nmode; ++j)
-        {
-            XRRModeInfo *mode = &resources->modes[j];
-
-            if (mode->id == output_info->modes[i])
-            {
-                unsigned int dots = mode->hTotal * mode->vTotal;
-                unsigned int refresh = dots ? (mode->dotClock + dots / 2) / dots : 0;
-
-                TRACE("Adding mode %#lx: %ux%u@%u.\n", mode->id, mode->width, mode->height, refresh);
-                X11DRV_Settings_AddOneMode( mode->width, mode->height, 0, refresh );
-                xrandr12_modes[xrandr_mode_count++] = mode->id;
-                break;
-            }
-        }
-    }
-
-    X11DRV_Settings_AddDepthModes();
-    ret = 0;
-
-done:
-    pXRRFreeOutputInfo( output_info );
-    pXRRFreeCrtcInfo( crtc_info );
-    pXRRFreeScreenResources( resources );
-    return ret;
-}
-
-#endif /* HAVE_XRRGETSCREENRESOURCES */
 
 void X11DRV_XRandR_Init(void)
 {
@@ -497,18 +257,7 @@ void X11DRV_XRandR_Init(void)
 
     TRACE("Found XRandR %d.%d.\n", major, minor);
 
-#ifdef HAVE_XRRGETSCREENRESOURCES
-    if (ret >= 2 && (major > 1 || (major == 1 && minor >= 2)))
-    {
-        if (major > 1 || (major == 1 && minor >= 3))
-            pXRRGetScreenResourcesCurrent = wine_dlsym( xrandr_handle, "XRRGetScreenResourcesCurrent", NULL, 0 );
-        if (!pXRRGetScreenResourcesCurrent)
-            pXRRGetScreenResourcesCurrent = pXRRGetScreenResources;
-    }
-
-    if (!pXRRGetScreenResourcesCurrent || xrandr12_init_modes() < 0)
-#endif
-        xrandr10_init_modes();
+        xrandr_init_modes();
 }
 
 #else /* SONAME_LIBXRANDR */

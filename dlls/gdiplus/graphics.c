@@ -465,7 +465,7 @@ static GpStatus alpha_blend_pixels_hrgn(GpGraphics *graphics, INT dst_x, INT dst
 
         GetRegionData(hrgn, size, rgndata);
 
-        rects = (RECT*)&rgndata->Buffer;
+        rects = (RECT*)rgndata->Buffer;
 
         for (i=0; stat == Ok && i<rgndata->rdh.nCount; i++)
         {
@@ -2113,6 +2113,25 @@ static GpStatus get_graphics_bounds(GpGraphics* graphics, GpRectF* rect)
         stat = GdipGetImageBounds(graphics->image, rect, &unit);
         if (stat == Ok && unit != UnitPixel)
             FIXME("need to convert from unit %i\n", unit);
+    }else if (GetObjectType(graphics->hdc) == OBJ_MEMDC){
+        HBITMAP hbmp;
+        BITMAP bmp;
+
+        rect->X = 0;
+        rect->Y = 0;
+
+        hbmp = GetCurrentObject(graphics->hdc, OBJ_BITMAP);
+        if (hbmp && GetObjectW(hbmp, sizeof(bmp), &bmp))
+        {
+            rect->Width = bmp.bmWidth;
+            rect->Height = bmp.bmHeight;
+        }
+        else
+        {
+            /* FIXME: ??? */
+            rect->Width = 1;
+            rect->Height = 1;
+        }
     }else{
         rect->X = 0;
         rect->Y = 0;
@@ -2250,6 +2269,8 @@ GpStatus WINGDIPAPI GdipCreateFromHDC(HDC hdc, GpGraphics **graphics)
 GpStatus WINGDIPAPI GdipCreateFromHDC2(HDC hdc, HANDLE hDevice, GpGraphics **graphics)
 {
     GpStatus retval;
+    HBITMAP hbitmap;
+    DIBSECTION dib;
 
     TRACE("(%p, %p, %p)\n", hdc, hDevice, graphics);
 
@@ -2272,6 +2293,13 @@ GpStatus WINGDIPAPI GdipCreateFromHDC2(HDC hdc, HANDLE hDevice, GpGraphics **gra
     if((retval = GdipCreateRegion(&(*graphics)->clip)) != Ok){
         GdipFree(*graphics);
         return retval;
+    }
+
+    hbitmap = GetCurrentObject(hdc, OBJ_BITMAP);
+    if (hbitmap && GetObjectW(hbitmap, sizeof(dib), &dib) == sizeof(dib) &&
+        dib.dsBmih.biBitCount == 32 && dib.dsBmih.biCompression == BI_RGB)
+    {
+        (*graphics)->alpha_hdc = 1;
     }
 
     (*graphics)->hdc = hdc;
@@ -3157,7 +3185,7 @@ GpStatus WINGDIPAPI GdipDrawImagePointsRect(GpGraphics *graphics, GpImage *image
             graphics->scale, image->xres, image->yres, bitmap->format,
             imageAttributes ? imageAttributes->outside_color : 0);
 
-        if (imageAttributes ||
+        if (imageAttributes || graphics->alpha_hdc ||
             (graphics->image && graphics->image->type == ImageTypeBitmap) ||
             ptf[1].Y != ptf[0].Y || ptf[2].X != ptf[0].X ||
             ptf[1].X - ptf[0].X != srcwidth || ptf[2].Y - ptf[0].Y != srcheight ||
@@ -4021,7 +4049,7 @@ GpStatus WINGDIPAPI GdipFillPath(GpGraphics *graphics, GpBrush *brush, GpPath *p
     if(graphics->busy)
         return ObjectBusy;
 
-    if (!graphics->image)
+    if (!graphics->image && !graphics->alpha_hdc)
         stat = GDI32_GdipFillPath(graphics, brush, path);
 
     if (stat == NotImplemented)
@@ -4359,7 +4387,7 @@ GpStatus WINGDIPAPI GdipFillRegion(GpGraphics* graphics, GpBrush* brush,
     if(graphics->busy)
         return ObjectBusy;
 
-    if (!graphics->image)
+    if (!graphics->image && !graphics->alpha_hdc)
         stat = GDI32_GdipFillRegion(graphics, brush, region);
 
     if (stat == NotImplemented)
@@ -5982,7 +6010,7 @@ GpStatus WINGDIPAPI GdipGetDC(GpGraphics *graphics, HDC *hdc)
     {
         stat = METAFILE_GetDC((GpMetafile*)graphics->image, hdc);
     }
-    else if (!graphics->hdc ||
+    else if (!graphics->hdc || graphics->alpha_hdc ||
         (graphics->image && graphics->image->type == ImageTypeBitmap && ((GpBitmap*)graphics->image)->format & PixelFormatAlpha))
     {
         /* Create a fake HDC and fill it with a constant color. */
@@ -6626,7 +6654,7 @@ static GpStatus draw_driver_string(GpGraphics *graphics, GDIPCONST UINT16 *text,
     if (length == -1)
         length = strlenW(text);
 
-    if (graphics->hdc &&
+    if (graphics->hdc && !graphics->alpha_hdc &&
         ((flags & DriverStringOptionsRealizedAdvance) || length <= 1) &&
         brush->bt == BrushTypeSolidColor &&
         (((GpSolidFill*)brush)->color & 0xff000000) == 0xff000000)

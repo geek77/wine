@@ -33,6 +33,13 @@ struct cached_glyph
     BYTE         bits[1];
 };
 
+enum glyph_type
+{
+    GLYPH_INDEX,
+    GLYPH_WCHAR,
+    GLYPH_NBTYPES
+};
+
 struct cached_font
 {
     struct list           entry;
@@ -41,8 +48,8 @@ struct cached_font
     LOGFONTW              lf;
     XFORM                 xform;
     UINT                  aa_flags;
-    UINT                  nb_glyphs;
-    struct cached_glyph **glyphs;
+    UINT                  nb_glyphs[GLYPH_NBTYPES];
+    struct cached_glyph **glyphs[GLYPH_NBTYPES];
 };
 
 static struct list font_cache = LIST_INIT( font_cache );
@@ -487,7 +494,7 @@ static int font_cache_cmp( const struct cached_font *p1, const struct cached_fon
 static struct cached_font *add_cached_font( HDC hdc, HFONT hfont, UINT aa_flags )
 {
     struct cached_font font, *ptr, *last_unused = NULL;
-    UINT i = 0;
+    UINT i = 0, j;
 
     GetObjectW( hfont, sizeof(font.lf), &font.lf );
     GetTransform( hdc, 0x204, &font.xform );
@@ -517,8 +524,11 @@ static struct cached_font *add_cached_font( HDC hdc, HFONT hfont, UINT aa_flags 
     if (i > 5)  /* keep at least 5 of the most-recently used fonts around */
     {
         ptr = last_unused;
-        for (i = 0; i < ptr->nb_glyphs; i++) HeapFree( GetProcessHeap(), 0, ptr->glyphs[i] );
-        HeapFree( GetProcessHeap(), 0, ptr->glyphs );
+        for (i = 0; i < GLYPH_NBTYPES; i++)
+        {
+            for (j = 0; j < ptr->nb_glyphs[i]; j++) HeapFree( GetProcessHeap(), 0, ptr->glyphs[i][j] );
+            HeapFree( GetProcessHeap(), 0, ptr->glyphs[i] );
+        }
         list_remove( &ptr->entry );
     }
     else if (!(ptr = HeapAlloc( GetProcessHeap(), 0, sizeof(*ptr) )))
@@ -529,9 +539,11 @@ static struct cached_font *add_cached_font( HDC hdc, HFONT hfont, UINT aa_flags 
 
     *ptr = font;
     ptr->ref = 1;
-    ptr->glyphs = NULL;
-    ptr->nb_glyphs = 0;
-
+    for (i = 0; i < GLYPH_NBTYPES; i++)
+    {
+        ptr->glyphs[i] = NULL;
+        ptr->nb_glyphs[i] = 0;
+    }
 done:
     list_add_head( &font_cache, &ptr->entry );
     LeaveCriticalSection( &font_cache_cs );
@@ -544,28 +556,32 @@ void release_cached_font( struct cached_font *font )
     if (font) InterlockedDecrement( &font->ref );
 }
 
-static void add_cached_glyph( struct cached_font *font, UINT index, struct cached_glyph *glyph )
+static void add_cached_glyph( struct cached_font *font, UINT index, UINT flags, struct cached_glyph *glyph )
 {
-    if (index >= font->nb_glyphs)
+    enum glyph_type type = (flags & ETO_GLYPH_INDEX) ? GLYPH_INDEX : GLYPH_WCHAR;
+
+    if (index >= font->nb_glyphs[type])
     {
         UINT new_count = (index + 128) & ~127;
         struct cached_glyph **new;
 
-        if (font->glyphs)
+        if (font->glyphs[type])
             new = HeapReAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY,
-                               font->glyphs, new_count * sizeof(*new) );
+                               font->glyphs[type], new_count * sizeof(*new) );
         else
             new = HeapAlloc( GetProcessHeap(), HEAP_ZERO_MEMORY, new_count * sizeof(*new) );
         if (!new) return;
-        font->glyphs = new;
-        font->nb_glyphs = new_count;
+        font->glyphs[type] = new;
+        font->nb_glyphs[type] = new_count;
     }
-    font->glyphs[index] = glyph;
+    font->glyphs[type][index] = glyph;
 }
 
-static struct cached_glyph *get_cached_glyph( struct cached_font *font, UINT index )
+static struct cached_glyph *get_cached_glyph( struct cached_font *font, UINT index, UINT flags )
 {
-    if (index < font->nb_glyphs) return font->glyphs[index];
+    enum glyph_type type = (flags & ETO_GLYPH_INDEX) ? GLYPH_INDEX : GLYPH_WCHAR;
+
+    if (index < font->nb_glyphs[type]) return font->glyphs[type][index];
     return NULL;
 }
 
@@ -574,18 +590,18 @@ static struct cached_glyph *get_cached_glyph( struct cached_font *font, UINT ind
  *
  * See the comment above get_pen_bkgnd_masks
  */
-static inline void get_text_bkgnd_masks( dibdrv_physdev *pdev, rop_mask *mask )
+static inline void get_text_bkgnd_masks( HDC hdc, const dib_info *dib, rop_mask *mask )
 {
-    COLORREF bg = GetBkColor( pdev->dev.hdc );
+    COLORREF bg = GetBkColor( hdc );
 
     mask->and = 0;
 
-    if (pdev->dib.bit_count != 1)
-        mask->xor = get_pixel_color( pdev, bg, FALSE );
+    if (dib->bit_count != 1)
+        mask->xor = get_pixel_color( hdc, dib, bg, FALSE );
     else
     {
-        COLORREF fg = GetTextColor( pdev->dev.hdc );
-        mask->xor = get_pixel_color( pdev, fg, TRUE );
+        COLORREF fg = GetTextColor( hdc );
+        mask->xor = get_pixel_color( hdc, dib, fg, TRUE );
         if (fg != bg) mask->xor = ~mask->xor;
     }
 }
@@ -654,9 +670,9 @@ static const int padding[4] = {0, 3, 2, 1};
  * For non-antialiased bitmaps convert them to the 17-level format
  * using only values 0 or 16.
  */
-static struct cached_glyph *cache_glyph_bitmap( HDC hdc, struct cached_font *font, UINT index )
+static struct cached_glyph *cache_glyph_bitmap( HDC hdc, struct cached_font *font, UINT index, UINT flags )
 {
-    UINT ggo_flags = font->aa_flags | GGO_GLYPH_INDEX;
+    UINT ggo_flags = font->aa_flags;
     static const MAT2 identity = { {0,1}, {0,0}, {0,0}, {0,1} };
     UINT indices[3] = {0, 0, 0x20};
     int i, x, y;
@@ -666,6 +682,7 @@ static struct cached_glyph *cache_glyph_bitmap( HDC hdc, struct cached_font *fon
     GLYPHMETRICS metrics;
     struct cached_glyph *glyph;
 
+    if (flags & ETO_GLYPH_INDEX) ggo_flags |= GGO_GLYPH_INDEX;
     indices[0] = index;
     for (i = 0; i < sizeof(indices) / sizeof(indices[0]); i++)
     {
@@ -712,18 +729,19 @@ static struct cached_glyph *cache_glyph_bitmap( HDC hdc, struct cached_font *fon
 
 done:
     glyph->metrics = metrics;
-    add_cached_glyph( font, index, glyph );
+    add_cached_glyph( font, index, flags, glyph );
     return glyph;
 }
 
 static void render_string( HDC hdc, dib_info *dib, struct cached_font *font, INT x, INT y,
-                           UINT flags, const WCHAR *str, UINT count, const INT *dx, DWORD text_color,
-                           const struct intensity_range *ranges, const struct clipped_rects *clipped_rects,
-                           RECT *bounds )
+                           UINT flags, const WCHAR *str, UINT count, const INT *dx,
+                           const struct clipped_rects *clipped_rects, RECT *bounds )
 {
     UINT i;
     struct cached_glyph *glyph;
     dib_info glyph_dib;
+    DWORD text_color;
+    struct intensity_range ranges[17];
 
     glyph_dib.bit_count    = get_glyph_depth( font->aa_flags );
     glyph_dib.rect.left    = 0;
@@ -731,11 +749,16 @@ static void render_string( HDC hdc, dib_info *dib, struct cached_font *font, INT
     glyph_dib.bits.is_copy = FALSE;
     glyph_dib.bits.free    = NULL;
 
+    text_color = get_pixel_color( hdc, dib, GetTextColor( hdc ), TRUE );
+
+    if (glyph_dib.bit_count == 8)
+        get_aa_ranges( dib->funcs->pixel_to_colorref( dib, text_color ), ranges );
+
     EnterCriticalSection( &font_cache_cs );
     for (i = 0; i < count; i++)
     {
-        if (!(glyph = get_cached_glyph( font, str[i] )) &&
-            !(glyph = cache_glyph_bitmap( hdc, font, str[i] ))) continue;
+        if (!(glyph = get_cached_glyph( font, str[i], flags )) &&
+            !(glyph = cache_glyph_bitmap( hdc, font, str[i], flags ))) continue;
 
         glyph_dib.width       = glyph->metrics.gmBlackBoxX;
         glyph_dib.height      = glyph->metrics.gmBlackBoxY;
@@ -770,10 +793,6 @@ BOOL render_aa_text_bitmapinfo( HDC hdc, BITMAPINFO *info, struct gdi_image_bits
                                 UINT aa_flags, LPCWSTR str, UINT count, const INT *dx )
 {
     dib_info dib;
-    BOOL got_pixel;
-    COLORREF fg, bg;
-    DWORD fg_pixel, bg_pixel;
-    struct intensity_range glyph_intensities[17];
     struct clipped_rects visrect;
     struct cached_font *font;
 
@@ -784,27 +803,16 @@ BOOL render_aa_text_bitmapinfo( HDC hdc, BITMAPINFO *info, struct gdi_image_bits
     visrect.count = 1;
     visrect.rects = &src->visrect;
 
-    fg = make_rgb_colorref( hdc, &dib, GetTextColor( hdc ), &got_pixel, &fg_pixel);
-    if (!got_pixel) fg_pixel = dib.funcs->colorref_to_pixel( &dib, fg );
-
-    get_aa_ranges( fg, glyph_intensities );
-
     if (flags & ETO_OPAQUE)
     {
         rop_mask bkgnd_color;
-
-        bg = make_rgb_colorref( hdc, &dib, GetBkColor( hdc ), &got_pixel, &bg_pixel);
-        if (!got_pixel) bg_pixel = dib.funcs->colorref_to_pixel( &dib, bg );
-
-        bkgnd_color.and = 0;
-        bkgnd_color.xor = bg_pixel;
+        get_text_bkgnd_masks( hdc, &dib, &bkgnd_color );
         dib.funcs->solid_rects( &dib, 1, &src->visrect, bkgnd_color.and, bkgnd_color.xor );
     }
 
     if (!(font = add_cached_font( hdc, GetCurrentObject( hdc, OBJ_FONT ), aa_flags ))) return FALSE;
 
-    render_string( hdc, &dib, font, x, y, flags, str, count, dx,
-                   fg_pixel, glyph_intensities, &visrect, NULL );
+    render_string( hdc, &dib, font, x, y, flags, str, count, dx, &visrect, NULL );
     release_cached_font( font );
     return TRUE;
 }
@@ -817,10 +825,7 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
 {
     dibdrv_physdev *pdev = get_dibdrv_pdev(dev);
     struct clipped_rects clipped_rects;
-    DC *dc;
     RECT bounds;
-    DWORD text_color;
-    struct intensity_range ranges[17];
 
     if (!pdev->font) return FALSE;
 
@@ -830,7 +835,7 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     if (flags & ETO_OPAQUE)
     {
         rop_mask bkgnd_color;
-        get_text_bkgnd_masks( pdev, &bkgnd_color );
+        get_text_bkgnd_masks( dev->hdc, &pdev->dib, &bkgnd_color );
         add_bounds_rect( &bounds, rect );
         get_clipped_rects( &pdev->dib, rect, pdev->clip, &clipped_rects );
         pdev->dib.funcs->solid_rects( &pdev->dib, clipped_rects.count, clipped_rects.rects,
@@ -851,13 +856,8 @@ BOOL dibdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     }
     if (!clipped_rects.count) goto done;
 
-    text_color = get_pixel_color( pdev, GetTextColor( pdev->dev.hdc ), TRUE );
-    get_aa_ranges( pdev->dib.funcs->pixel_to_colorref( &pdev->dib, text_color ), ranges );
-
-    dc = get_dc_ptr( dev->hdc );
     render_string( dev->hdc, &pdev->dib, pdev->font, x, y, flags, str, count, dx,
-                   text_color, ranges, &clipped_rects, &bounds );
-    release_dc_ptr( dc );
+                   &clipped_rects, &bounds );
 
 done:
     add_clipped_bounds( pdev, &bounds, pdev->clip );
@@ -975,7 +975,7 @@ static void fill_row( dib_info *dib, HRGN clip, RECT *row, DWORD pixel, UINT typ
 BOOL dibdrv_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT type )
 {
     dibdrv_physdev *pdev = get_dibdrv_pdev( dev );
-    DWORD pixel = get_pixel_color( pdev, color, FALSE );
+    DWORD pixel = get_pixel_color( dev->hdc, &pdev->dib, color, FALSE );
     RECT row;
     HRGN rgn;
 
@@ -1008,7 +1008,7 @@ COLORREF dibdrv_GetNearestColor( PHYSDEV dev, COLORREF color )
 
     TRACE( "(%p, %08x)\n", dev, color );
 
-    pixel = get_pixel_color( pdev, color, FALSE );
+    pixel = get_pixel_color( dev->hdc, &pdev->dib, color, FALSE );
     return pdev->dib.funcs->pixel_to_colorref( &pdev->dib, pixel );
 }
 
@@ -1481,7 +1481,7 @@ COLORREF dibdrv_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
     add_clipped_bounds( pdev, &rect, pdev->clip );
 
     /* SetPixel doesn't do the 1bpp massaging like other fg colors */
-    pixel = get_pixel_color( pdev, color, FALSE );
+    pixel = get_pixel_color( dev->hdc, &pdev->dib, color, FALSE );
     color = pdev->dib.funcs->pixel_to_colorref( &pdev->dib, pixel );
 
     if (!get_clipped_rects( &pdev->dib, &rect, pdev->clip, &clipped_rects )) return color;
